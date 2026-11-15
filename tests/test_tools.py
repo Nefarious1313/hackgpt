@@ -5,6 +5,7 @@ import base64
 import json
 import os
 import unittest
+from unittest.mock import patch
 
 from hackgpt import config as C
 from hackgpt.config import ScopeDenied
@@ -23,6 +24,8 @@ from hackgpt.tools import (
     h_shell,
     h_tls_cert,
     h_web_dirs,
+    h_msf_catalog,
+    h_dns_snapshot,
 )
 
 from .helpers import make_ctx
@@ -244,6 +247,47 @@ class NetworkToolsDryRun(unittest.TestCase):
         ctx = make_ctx(scope=["example.com"])
         with self.assertRaises(ToolError):
             h_web_dirs({"url": "example.com", "wordlist": "nope.txt"}, ctx)
+
+
+class DnsSnapshot(unittest.TestCase):
+    def test_reports_changes_against_persisted_snapshot(self):
+        ctx = make_ctx(scope=["example.com"])
+        rows = [type("Row", (), {"__getitem__": lambda self, k: ("192.0.2.10", 0)[0]})()]
+        with patch("hackgpt.tools.socket.getaddrinfo", return_value=[(0, 0, 0, "", ("192.0.2.10", 0))]):
+            first = h_dns_snapshot({"domain": "example.com"}, ctx)
+        self.assertIn("baseline created", first)
+        with patch("hackgpt.tools.socket.getaddrinfo", return_value=[(0, 0, 0, "", ("192.0.2.11", 0))]):
+            second = h_dns_snapshot({"domain": "example.com"}, ctx)
+        self.assertIn("added: 192.0.2.11", second)
+        self.assertIn("removed: 192.0.2.10", second)
+
+    def test_requires_scope(self):
+        with self.assertRaises(ScopeDenied):
+            h_dns_snapshot({"domain": "example.com"}, make_ctx(scope=[]))
+
+    def test_dry_run_does_not_write(self):
+        ctx = make_ctx(scope=["example.com"], dry_run=True)
+        self.assertIn("[dry-run]", h_dns_snapshot({"domain": "example.com"}, ctx))
+
+
+class MetasploitCatalog(unittest.TestCase):
+    def test_search_uses_auxiliary_catalog_only(self):
+        ctx = make_ctx()
+        proc = type("Proc", (), {"stdout": "auxiliary/scanner/http/title\\n", "stderr": "", "returncode": 0})()
+        with patch("hackgpt.tools.C.which", return_value="/usr/bin/msfconsole"):
+            with patch("hackgpt.tools.subprocess.run", return_value=proc) as run:
+                out = h_msf_catalog({"action": "search", "query": "http title"}, ctx)
+        self.assertIn("auxiliary/scanner/http/title", out)
+        self.assertIn("type:auxiliary", run.call_args.args[0][-1])
+        self.assertEqual(ctx.session["actions"][-1]["tool"], "msf_catalog")
+
+    def test_rejects_module_execution(self):
+        with self.assertRaises(ToolError):
+            h_msf_catalog({"action": "run", "query": "exploit/multi/handler"}, make_ctx())
+
+    def test_search_query_rejects_command_separators(self):
+        with self.assertRaises(ToolError):
+            h_msf_catalog({"action": "search", "query": "http; exploit"}, make_ctx())
 
 
 if __name__ == "__main__":

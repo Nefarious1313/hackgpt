@@ -20,11 +20,13 @@ from .tools import (
     Ctx,
     h_cve_lookup,
     h_dns_recon,
+    h_dns_snapshot,
     h_encode,
     h_exploit_search,
     h_hash_info,
     h_http_probe,
     h_ip_info,
+    h_msf_catalog,
     h_nmap,
     h_note,
     h_report,
@@ -37,7 +39,7 @@ from .tools import (
 WEB_PORTS = {80, 443, 8000, 8080, 8443, 8888, 3000, 5000, 9000}
 PY_MODULES = {"requests": "requests", "httpx": "httpx", "yaml": "pyyaml"}
 CORE_BINARIES = ["nmap", "ncat", "curl", "openssl"]
-OPTIONAL_BINARIES = ["dig", "whois"]
+OPTIONAL_BINARIES = ["dig", "whois", "msfconsole", "msfvenom"]
 
 
 def _ts() -> str:
@@ -190,7 +192,7 @@ def auto_engagement(target: str, cfg: dict, session: dict, console: t.Any,
                     deep: bool = False, dry_run: bool = False,
                     research: bool = False) -> dict:
     """Full deterministic pipeline: recon -> scan -> web -> report."""
-    target = target.strip()
+    target = C.normalize_target(str(target).strip()) or str(target).strip()
     _seed_scope(cfg, target)
     ctx = make_ctx(cfg, session, console, dry_run)
     console.banner(
@@ -206,6 +208,7 @@ def auto_engagement(target: str, cfg: dict, session: dict, console: t.Any,
         console.tool(h_ip_info({"target": target}, ctx)[:900])
     else:
         console.tool(h_dns_recon({"domain": target}, ctx)[:900])
+        console.tool(h_dns_snapshot({"domain": target}, ctx)[:700])
         console.tool(h_subdomain_enum({"domain": target}, ctx)[:900])
         summary["subdomains"] = _subdomain_count(ctx)
 
@@ -279,7 +282,7 @@ def auto_engagement(target: str, cfg: dict, session: dict, console: t.Any,
 def quick_scan(target: str, cfg: dict, session: dict, console: t.Any,
                dry_run: bool = False) -> dict:
     """Fast path: nmap top100 + a web probe."""
-    target = target.strip()
+    target = C.normalize_target(str(target).strip()) or str(target).strip()
     _seed_scope(cfg, target)
     ctx = make_ctx(cfg, session, console, dry_run)
     console.banner(f"quick scan: {target}")
@@ -310,6 +313,30 @@ def web_checks(url: str, cfg: dict, session: dict, console: t.Any,
     return {"url": url}
 
 
+def watch_dns(domain: str, cfg: dict, session: dict, console: t.Any,
+             interval: int = 3600, count: int = 0, dry_run: bool = False) -> dict:
+    """Poll a scoped domain's A/AAAA baseline. count=0 runs until interrupted."""
+    domain = C.normalize_target(str(domain).strip()) or str(domain).strip()
+    if interval < 1:
+        raise ValueError("interval must be at least 1 second")
+    if count < 0:
+        raise ValueError("count cannot be negative")
+    _seed_scope(cfg, domain)
+    ctx = make_ctx(cfg, session, console, dry_run)
+    polls = 0
+    try:
+        while count == 0 or polls < count:
+            result = h_dns_snapshot({"domain": domain}, ctx)
+            console.tool(result)
+            polls += 1
+            if count == 0 or polls < count:
+                time.sleep(interval)
+    except KeyboardInterrupt:
+        _say(console, "DNS watch stopped by operator")
+    h_report({"action": "save"}, ctx)
+    return {"domain": domain, "polls": polls, "report": os.path.join(C.OUTPUT_DIR, "report-" + session["name"] + ".md")}
+
+
 def research(query: str, cfg: dict, session: dict, console: t.Any) -> dict:
     """CVE + exploit research (no remote target, no scope needed)."""
     ctx = make_ctx(cfg, session, console, False)
@@ -338,6 +365,8 @@ def utility(kind: str, args: dict, cfg: dict, session: dict, console: t.Any) -> 
         return h_tls_cert(args, ctx)
     if kind == "dirs":
         return h_web_dirs(args, ctx)
+    if kind == "msf":
+        return h_msf_catalog(args, ctx)
     raise ValueError(f"unknown utility '{kind}'")
 
 

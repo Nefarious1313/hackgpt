@@ -64,7 +64,9 @@ hackgpt --auto example.com            # recon -> scan -> web -> report
 hackgpt --auto 203.0.113.0/24 --deep --research
 hackgpt --quick example.com           # nmap top100 + web probe
 hackgpt --web https://example.com      # headers/methods/CORS/paths + TLS
-hackgpt --menu                        # guided numbered menu
+hackgpt --watch-dns example.com --interval 3600 --count 0  # monitor DNS until Ctrl-C
+hackgpt --dry-run --watch-dns example.com --count 1       # preview a single poll
+hackgpt --menu                        # guided menu (option 9 watches DNS)
 hackgpt --doctor                      # check deps / auth / model
 hackgpt --doctor --fix                # install what is missing
 ```
@@ -104,6 +106,8 @@ Scope entries accept hosts, domains, IPs, CIDR ranges, and `*.domain` wildcards.
 | `ip_info` | IP/CIDR ownership, ASN, geolocation (ipinfo.io) |
 | `tls_cert` | Fetch and parse the TLS certificate for host:port (openssl) |
 | `web_dirs` | Probe common paths or a supplied wordlist on a web server |
+| `dns_snapshot` | Persist scoped A/AAAA baseline and report DNS changes |
+| `msf_catalog` | Check Metasploit or search auxiliary modules locally; no module execution |
 | `note` | Record findings/credentials/targets with evidence |
 | `scope` | list/add/remove/check authorized targets |
 | `file_write` | Write an artifact (exploit, wordlist, script) |

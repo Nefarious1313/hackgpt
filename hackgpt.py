@@ -143,6 +143,11 @@ def run_objective(objective: str, cfg: dict, session: dict, console: Console, ap
     prompts.bootstrap_session(session)
     if not session["messages"]:
         session["messages"] = prompts.initial_messages(objective, cfg.get("scope", []))
+    else:
+        last_user = next((m for m in reversed(session["messages"]) if m.get("role") == "user"), {})
+        last_content = str(last_user.get("content") or "")
+        if objective not in last_content:
+            session["messages"].append({"role": "user", "content": objective})
     messages, msg = run_agent(session["messages"], ctx, api, console)
     session["messages"] = messages
     save(cfg, session, messages)
@@ -268,6 +273,9 @@ def main() -> int:
     ap.add_argument("--auto", metavar="TARGET", help="one-command deterministic engagement + report")
     ap.add_argument("--quick", metavar="TARGET", help="nmap top100 + web probe")
     ap.add_argument("--web", metavar="URL", help="deep web checks on a URL")
+    ap.add_argument("--watch-dns", metavar="DOMAIN", help="watch scoped A/AAAA DNS changes (Ctrl-C to stop)")
+    ap.add_argument("--interval", type=int, default=3600, help="DNS watch interval in seconds (default 3600)")
+    ap.add_argument("--count", type=int, default=0, help="DNS watch polls; 0 means until interrupted")
     ap.add_argument("--deep", action="store_true", help="with --auto: nmap -p- -sV")
     ap.add_argument("--research", action="store_true", help="with --auto: add a light CVE pass")
     ap.add_argument("--menu", action="store_true", help="guided menu")
@@ -311,6 +319,16 @@ def main() -> int:
     ctx = build_ctx(cfg, session, console, args.dry_run)
 
     # ---- automated / guided modes ---------------------------------------
+    if args.watch_dns:
+        if args.interval < 1 or args.count < 0:
+            console.error("--interval must be >= 1 and --count must be >= 0")
+            return 2
+        sess = C.load_session(args.session)
+        prompts.bootstrap_session(sess)
+        automation.watch_dns(args.watch_dns, cfg, sess, console, interval=args.interval,
+                             count=args.count, dry_run=args.dry_run)
+        save(cfg, sess, sess.get("messages", []))
+        return 0
     if args.doctor:
         return 0 if automation.doctor(cfg, fix=args.fix, console=console) else 1
     if args.auto:

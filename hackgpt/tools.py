@@ -104,7 +104,7 @@ NMAP_PROFILES: dict[str, list[str]] = {
     "udp":      ["-sU", "--top-ports", "100", "--open", "--host-timeout", "10m"],
 }
 
-_NMAP_PORT = re.compile(r"^(\d+/\w+)\s+open\s+(\S+)(?:\s+(\S+))?", re.MULTILINE)
+_NMAP_PORT = re.compile(r"^(\d+/\w+)[ \t]+open[ \t]+(\S+)(?:[ \t]+(\S+))?", re.MULTILINE)
 
 
 def h_nmap(args: dict, ctx: Ctx) -> str:
@@ -289,9 +289,12 @@ def h_dns_recon(args: dict, ctx: Ctx) -> str:
     domain = str(args.get("domain", "")).strip()
     if not domain:
         raise ToolError("dns_recon: 'domain' is required")
+    domain = C.normalize_target(domain) or domain
     C.require_scope(ctx.config, domain)
     types = str(args.get("types") or "A,AAAA,CNAME,MX,NS,TXT,SOA")
     ctx.console.log_action("dns_recon", domain)
+    if ctx.dry_run:
+        return f"[dry-run] would resolve {types} for {domain}"
     out: list[str] = []
     for rtype in [t.strip().upper() for t in types.split(",") if t.strip()]:
         if C.which("dig"):
@@ -325,9 +328,12 @@ def h_subdomain_enum(args: dict, ctx: Ctx) -> str:
     domain = str(args.get("domain", "")).strip()
     if not domain:
         raise ToolError("subdomain_enum: 'domain' is required")
+    domain = C.normalize_target(domain) or domain
     C.require_scope(ctx.config, domain)
     source = str(args.get("source") or "all").lower()
     ctx.console.log_action("subdomain_enum", domain)
+    if ctx.dry_run:
+        return f"[dry-run] would enumerate subdomains of {domain} ({source})"
     found: set[str] = set()
     if source in ("all", "crtsh"):
         try:
@@ -349,7 +355,8 @@ def h_subdomain_enum(args: dict, ctx: Ctx) -> str:
                 sub = line.split(",", 1)[0].strip().lower()
                 if sub and " " not in sub:
                     found.add(sub)
-    subs = sorted(x for x in found if not x.startswith("["))
+    subs = sorted(x for x in found
+                  if not x.startswith("[") and (x == domain or x.endswith("." + domain)))
     errs = [x for x in found if x.startswith("[")]
     if subs:
         ctx.session["targets"].append({"target": domain, "subdomains": subs, "ts": _ts()})
@@ -823,6 +830,93 @@ def h_web_dirs(args: dict, ctx: Ctx) -> str:
 
 
 # --------------------------------------------------------------------------
+# DNS snapshot / change detection
+# --------------------------------------------------------------------------
+
+def h_dns_snapshot(args: dict, ctx: Ctx) -> str:
+    domain = str(args.get("domain", "")).strip()
+    if not domain:
+        raise ToolError("dns_snapshot: 'domain' is required")
+    domain = C.normalize_target(domain) or domain
+    domain = domain.lower().rstrip(".")
+    if not re.fullmatch(r"[a-z0-9.-]+", domain) or ".." in domain:
+        raise ToolError("dns_snapshot: provide a valid domain name")
+    C.require_scope(ctx.config, domain)
+    if ctx.dry_run:
+        return f"[dry-run] would resolve A/AAAA records and compare the saved baseline for {domain}"
+    try:
+        answers = socket.getaddrinfo(domain, None, type=socket.SOCK_STREAM)
+        current = sorted({str(row[4][0]) for row in answers})
+        if not current:
+            raise OSError("resolver returned no A/AAAA addresses")
+    except Exception as exc:  # noqa: BLE001
+        raise ToolError(f"dns_snapshot: resolution failed: {exc}") from None
+
+    directory = os.path.join(ctx.output_dir, "dns-snapshots")
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, domain + ".json")
+    previous: list[str] | None = None
+    if os.path.isfile(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                stored = json.load(fh)
+            previous = sorted(set(str(ip) for ip in stored.get("addresses", [])))
+        except (OSError, ValueError, AttributeError):
+            raise ToolError(f"dns_snapshot: saved baseline is unreadable: {path}") from None
+
+    payload = {"domain": domain, "addresses": current, "updated": _ts()}
+    temp_path = path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    os.replace(temp_path, path)
+    ctx.session["actions"].append({"tool": "dns_snapshot", "domain": domain, "ts": _ts()})
+    ctx.session["artifacts"].append(path)
+    if previous is None:
+        return f"DNS baseline created for {domain}: {', '.join(current)}"
+    added = sorted(set(current) - set(previous))
+    removed = sorted(set(previous) - set(current))
+    if not added and not removed:
+        return f"No DNS changes for {domain}; addresses: {', '.join(current)}"
+    change = f"DNS changes for {domain}: added: {', '.join(added) or '-'}; removed: {', '.join(removed) or '-'}"
+    ctx.session["findings"].append({"category": "observation", "text": change, "host": domain, "ts": _ts()})
+    return change
+
+
+# --------------------------------------------------------------------------
+# Metasploit catalog helper (search-only; never executes modules)
+# --------------------------------------------------------------------------
+
+def h_msf_catalog(args: dict, ctx: Ctx) -> str:
+    action = str(args.get("action", "status")).strip().lower()
+    if action == "status":
+        path = C.which("msfconsole")
+        return f"msfconsole: {path}" if path else "msfconsole not installed"
+    if action != "search":
+        raise ToolError("msf_catalog supports only action=status or search; module execution is not exposed")
+    query = str(args.get("query", "")).strip()
+    if not query:
+        raise ToolError("msf_catalog search requires a query")
+    if len(query) > 120 or not re.fullmatch(r"[A-Za-z0-9 _./:-]+", query):
+        raise ToolError("msf_catalog query may contain only letters, digits, spaces, '.', '/', ':', '_' and '-'")
+    binary = C.which("msfconsole")
+    if not binary:
+        raise ToolError("msfconsole not found; install Metasploit Framework to use the local catalog")
+    command = [binary, "-q", "-x", f"search type:auxiliary {query}; exit"]
+    if ctx.dry_run:
+        return "[dry-run] would search local Metasploit auxiliary module catalog; no module would run"
+    try:
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise ToolError("msf_catalog search timed out after 60 seconds") from None
+    except Exception as exc:  # noqa: BLE001
+        raise ToolError(f"msf_catalog search failed: {exc}") from None
+    output = (proc.stdout or "") + (proc.stderr or "")
+    ctx.session["actions"].append({"tool": "msf_catalog", "action": "search", "query": query,
+                                   "returncode": proc.returncode, "ts": _ts()})
+    return clip(output.strip() or f"Metasploit search returned no output (exit {proc.returncode})")
+
+
+# --------------------------------------------------------------------------
 # registry
 # --------------------------------------------------------------------------
 
@@ -930,6 +1024,13 @@ TOOLS: list[dict] = [
              "limit": {"type": "integer", "description": "max paths to probe (default 60)"},
              "timeout": {"type": "number"}},
             ["url"]),
+    _schema("dns_snapshot", "Resolve scoped-domain A/AAAA records, persist a local baseline, and report changes.",
+            {"domain": {"type": "string", "description": "in-scope domain"}}, ["domain"]),
+    _schema("msf_catalog", "Check local Metasploit availability or search only its auxiliary module catalog. "
+                          "Never executes modules or sends traffic.",
+            {"action": {"type": "string", "description": "status|search"},
+             "query": {"type": "string", "description": "local catalog search text"}},
+            ["action"]),
 ]
 
 HANDLERS = {
@@ -952,4 +1053,6 @@ HANDLERS = {
     "ip_info": h_ip_info,
     "tls_cert": h_tls_cert,
     "web_dirs": h_web_dirs,
+    "dns_snapshot": h_dns_snapshot,
+    "msf_catalog": h_msf_catalog,
 }

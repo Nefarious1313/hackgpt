@@ -111,6 +111,30 @@ class AgentLoop(unittest.TestCase):
         self.assertTrue(any("SCOPE DENIED" in str(o) for o in ctx.console.output))
 
 
+class AgentAutomationInstructions(unittest.TestCase):
+    def test_prompt_directs_agent_to_execute_clear_requests(self):
+        self.assertIn("execute the requested task with available tools", cli.prompts.SYSTEM_PROMPT)
+
+
+class RunObjective(unittest.TestCase):
+    def test_new_objective_is_appended_to_existing_session(self):
+        ctx = make_ctx(name="resumed")
+        session = ctx.session
+        session["messages"] = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old objective"},
+            {"role": "assistant", "content": "old result"},
+        ]
+        api = FakeAPI([{"role": "assistant", "content": "completed new request", "tool_calls": []}])
+
+        cli.run_objective("new natural-language request", ctx.config, session, ctx.console, api, ctx,
+                          save_report=False)
+
+        self.assertEqual(api.calls, 1)
+        self.assertEqual(session["messages"][-2]["role"], "user")
+        self.assertEqual(session["messages"][-2]["content"], "new natural-language request")
+
+
 class SaveAndCtx(unittest.TestCase):
     def test_build_ctx_creates_workdir(self):
         cfg = {"scope": []}

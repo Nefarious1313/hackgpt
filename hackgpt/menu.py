@@ -19,6 +19,7 @@ MENU = """\
   - 6) Ask the AI       — natural-language objective (agent loop)
   - 7) Doctor           — check deps, auth, model
   - 8) Help             — flags and usage
+  - 9) Watch DNS        — compare scoped A/AAAA records on an interval
   - 0) Exit"""
 
 UTIL_MENU = """\
@@ -28,6 +29,7 @@ UTIL_MENU = """\
   - 3) IP intel (ASN / geo)
   - 4) TLS certificate
   - 5) directory probe
+  - 6) Metasploit auxiliary-module catalog search (search only)
   - 0) Back"""
 
 HELP = """\
@@ -131,8 +133,23 @@ def run_menu(cfg: dict, console, api, run_objective) -> int:
         elif choice == "8":
             console.assistant(HELP)
 
+        elif choice == "9":
+            domain = _ask(console, "in-scope domain", required=True)
+            if not domain:
+                continue
+            try:
+                interval = int(_ask(console, "interval seconds [3600]") or 3600)
+                count = int(_ask(console, "poll count [0 = until Ctrl-C]") or 0)
+            except ValueError:
+                console.error("interval and poll count must be integers")
+                continue
+            name = _ask(console, "session name [dns-watch]") or "dns-watch"
+            session = _session(name)
+            A.watch_dns(domain, cfg, session, console, interval=interval, count=count)
+            _finish(cfg, session)
+
         else:
-            console.error("choose 0-8")
+            console.error("choose 0-9")
     return 0
 
 
@@ -164,8 +181,12 @@ def _utilities(cfg: dict, console) -> None:
                 }, cfg, session, console)
             elif choice == "5":
                 out = A.utility("dirs", {"url": _ask(console, "url", required=True)}, cfg, session, console)
+            elif choice == "6":
+                action = _ask(console, "action (status/search) [search]") or "search"
+                query = _ask(console, "auxiliary module search query") if action == "search" else ""
+                out = A.utility("msf", {"action": action, "query": query}, cfg, session, console)
             else:
-                console.error("choose 0-5")
+                console.error("choose 0-6")
                 continue
             console.assistant(out)
         except Exception as exc:  # noqa: BLE001
