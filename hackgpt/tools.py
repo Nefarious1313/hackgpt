@@ -176,6 +176,9 @@ def h_http_probe(args: dict, ctx: Ctx) -> str:
     follow = bool(args.get("follow", True))
     timeout = float(args.get("timeout") or 20)
 
+    if ctx.dry_run:
+        return f"[dry-run] would {method} {url}"
+
     ctx.console.log_action("http_probe", f"{method} {url}")
     try:
         with _http_client(ctx, timeout, follow) as cli:
@@ -212,6 +215,9 @@ def h_web_vuln_scan(args: dict, ctx: Ctx) -> str:
     do = set(x.strip() for x in checks.split(",") if x.strip())
     timeout = float(args.get("timeout") or 20)
     base = "{0.scheme}://{0.netloc}".format(urllib.parse.urlparse(url))
+
+    if ctx.dry_run:
+        return f"[dry-run] would run web checks ({checks}) on {url}"
 
     ctx.console.log_action("web_vuln_scan", url)
     findings: list[str] = []
@@ -292,8 +298,15 @@ def h_dns_recon(args: dict, ctx: Ctx) -> str:
             res = _run(["dig", "+noall", "+answer", "+time=3", domain, rtype])
         elif C.which("nslookup"):
             res = _run(["nslookup", "-type=" + rtype, domain])
+        elif rtype in ("A", "AAAA"):
+            try:
+                infos = socket.getaddrinfo(domain, None)
+                ips = sorted({i[4][0] for i in infos})
+                res = "\n".join(f"{domain}. IN {rtype} {ip}" for ip in ips) or "no address"
+            except Exception as exc:  # noqa: BLE001
+                res = f"[resolver error] {exc}"
         else:
-            res = "[no dig/nslookup available]"
+            res = "[no dig/nslookup available — install dnsutils for this record type]"
         res = res.strip()
         if res:
             out.append(f"[{rtype}]\n{res}")
@@ -709,6 +722,8 @@ def h_ip_info(args: dict, ctx: Ctx) -> str:
         label = f"{target} -> network {host}/{net.prefixlen}"
     C.require_scope(ctx.config, host)
     ctx.console.log_action("ip_info", label)
+    if ctx.dry_run:
+        return f"[dry-run] would look up {label}"
     try:
         data = _http_get_json(f"https://ipinfo.io/{urllib.parse.quote(host)}/json", timeout=20)
     except Exception as exc:  # noqa: BLE001

@@ -4,7 +4,8 @@ A custom, local, terminal-native offensive-security copilot wrapped around the
 free Nous inference model (`meituan/longcat-2.5:free` by default). It plans an
 engagement, drives real tools (nmap, DNS, HTTP, CVE research, payload
 generation, encoding, IP intel, TLS and directory checks), records findings,
-and writes a markdown report — all from a REPL or a one-shot command.
+and writes a markdown report. Point it at a target and it runs the whole
+engagement itself (`--auto`), or pick a numbered option from `--menu`.
 
 Nothing leaves the device except the API calls to the Nous endpoint and whatever
 targets you point it at. The OAuth bearer is read from Hermes' auth state
@@ -28,7 +29,13 @@ hackgpt --help
 ## Quick start
 
 ```bash
-# One-shot objective (local work needs no scope)
+# Simplest: one target, full pipeline, report (no model needed)
+hackgpt --auto example.com
+
+# Guided numbered menu
+hackgpt --menu
+
+# One-shot AI objective (local work needs no scope)
 hackgpt "Check what's listening locally and summarize the risk."
 
 # Scoped remote engagement
@@ -43,9 +50,29 @@ hackgpt> /report save
 hackgpt> /exit
 ```
 
-Useful flags: `--dry-run` (no execution), `--confirm` (confirm each shell
-command), `--no-scope` (lab/CTF), `--report` (save report on exit),
-`--reset` (fresh history), `--model <id>` (swap model).
+Useful flags: `--dry-run` (no execution, including network probes), `--confirm`
+(confirm each shell command), `--no-scope` (lab/CTF), `--report` (save report on
+exit), `--reset` (fresh history), `--model <id>` (swap model).
+
+## One-command modes (deterministic, no model needed)
+
+`--auto`, `--quick`, `--web` and `--menu` drive the tools directly, so they work
+even while the Nous free tier is at capacity.
+
+```bash
+hackgpt --auto example.com            # recon -> scan -> web -> report
+hackgpt --auto 203.0.113.0/24 --deep --research
+hackgpt --quick example.com           # nmap top100 + web probe
+hackgpt --web https://example.com      # headers/methods/CORS/paths + TLS
+hackgpt --menu                        # guided numbered menu
+hackgpt --doctor                      # check deps / auth / model
+hackgpt --doctor --fix                # install what is missing
+```
+
+Every mode writes `sessions/<name>.json` and `output/report-<name>.md`. `--auto`
+seeds the scope for the target automatically; `--deep` uses `nmap -p- -sV`;
+`--research` adds a short CVE pass over discovered services. Add `--dry-run` to
+preview without touching the network or the host.
 
 ## Scope model
 
@@ -92,6 +119,8 @@ Scope entries accept hosts, domains, IPs, CIDR ranges, and `*.domain` wildcards.
 │   ├── config.py       # config, scope engine, session persistence
 │   ├── prompts.py      # persona + system prompt
 │   ├── tools.py        # tool schemas + handlers (the capability layer)
+│   ├── automation.py   # doctor + deterministic one-command engagements
+│   ├── menu.py         # guided numbered menu
 │   ├── report.py       # markdown report renderer
 │   └── ui.py           # rich/plain terminal I/O
 ├── config.yaml         # model, flags, scope (created on first run)
@@ -135,6 +164,10 @@ registry consistency, and the agent loop's tool dispatch + prose-JSON fallback.
 - If a model emits a JSON tool call in prose instead of native calling, the CLI
   parses and executes it (fallback, including nested `arguments` objects), so
   behaviour is stable across models.
+- `--dry-run` suppresses shell, nmap, http_probe, web_vuln_scan, web_dirs,
+  ip_info, tls_cert and listener — it does not touch the network or the host.
+- `dns_recon` resolves A/AAAA through the system resolver when `dig`/`nslookup`
+  are absent; install `dnsutils` (`hackgpt --doctor --fix`) for MX/NS/TXT/SOA.
 - Active scans are rate-limited by profile; keep `stealth`/`udp` for ranges you
   own (they need raw sockets / root).
 - Only test systems you are authorized to test. Scope enforcement is on by

@@ -26,12 +26,13 @@ if HERE not in sys.path:
 
 from hackgpt import config as C  # noqa: E402
 from hackgpt import prompts  # noqa: E402
+from hackgpt import automation, menu  # noqa: E402
 from hackgpt.api import APIAuthError, APIError, NousAPI  # noqa: E402
 from hackgpt.config import ScopeDenied  # noqa: E402
 from hackgpt.tools import HANDLERS, TOOLS, Ctx, ToolError  # noqa: E402
 from hackgpt.ui import Console  # noqa: E402
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 
 def build_ctx(cfg: dict, session: dict, console: Console, dry_run: bool) -> Ctx:
@@ -133,6 +134,25 @@ def run_agent(messages: list[dict], ctx: Ctx, api: NousAPI, console: Console) ->
 
     console.error(f"stopped after {max_iter} tool iterations without a final answer")
     return messages, last
+
+
+def run_objective(objective: str, cfg: dict, session: dict, console: Console, api: NousAPI,
+                  ctx: Ctx, save_report: bool = True) -> tuple[list[dict], dict | None]:
+    """Single-shot AI engagement: bootstrap, run the agent loop, persist, report."""
+    session["objective"] = objective
+    prompts.bootstrap_session(session)
+    if not session["messages"]:
+        session["messages"] = prompts.initial_messages(objective, cfg.get("scope", []))
+    messages, msg = run_agent(session["messages"], ctx, api, console)
+    session["messages"] = messages
+    save(cfg, session, messages)
+    if save_report:
+        from hackgpt.report import render_markdown
+        path = os.path.join(C.OUTPUT_DIR, f"report-{session['name']}.md")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(render_markdown(session, cfg))
+        console.status(f"report saved -> {path}")
+    return messages, msg
 
 
 def save(cfg: dict, session: dict, messages: list[dict]) -> None:
@@ -245,6 +265,14 @@ def main() -> int:
     ap.add_argument("--max-iter", type=int, help="max tool iterations per turn")
     ap.add_argument("--reset", action="store_true", help="start with a clean session history")
     ap.add_argument("--report", action="store_true", help="save report to output/ on exit")
+    ap.add_argument("--auto", metavar="TARGET", help="one-command deterministic engagement + report")
+    ap.add_argument("--quick", metavar="TARGET", help="nmap top100 + web probe")
+    ap.add_argument("--web", metavar="URL", help="deep web checks on a URL")
+    ap.add_argument("--deep", action="store_true", help="with --auto: nmap -p- -sV")
+    ap.add_argument("--research", action="store_true", help="with --auto: add a light CVE pass")
+    ap.add_argument("--menu", action="store_true", help="guided menu")
+    ap.add_argument("--doctor", action="store_true", help="check deps, auth, model")
+    ap.add_argument("--fix", action="store_true", help="with --doctor: install what is missing")
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--version", action="version", version=f"hackgpt {VERSION}")
     args = ap.parse_args()
@@ -282,24 +310,43 @@ def main() -> int:
     state = {"dry_run": args.dry_run}
     ctx = build_ctx(cfg, session, console, args.dry_run)
 
+    # ---- automated / guided modes ---------------------------------------
+    if args.doctor:
+        return 0 if automation.doctor(cfg, fix=args.fix, console=console) else 1
+    if args.auto:
+        sess = C.load_session(args.session)
+        prompts.bootstrap_session(sess)
+        automation.auto_engagement(args.auto, cfg, sess, console, deep=args.deep,
+                                   dry_run=args.dry_run, research=args.research)
+        save(cfg, sess, sess.get("messages", []))
+        return 0
+    if args.quick:
+        sess = C.load_session(args.session)
+        prompts.bootstrap_session(sess)
+        automation.quick_scan(args.quick, cfg, sess, console, dry_run=args.dry_run)
+        save(cfg, sess, sess.get("messages", []))
+        return 0
+    if args.web:
+        sess = C.load_session(args.session)
+        prompts.bootstrap_session(sess)
+        automation.web_checks(args.web, cfg, sess, console, dry_run=args.dry_run)
+        save(cfg, sess, sess.get("messages", []))
+        return 0
+    if args.menu:
+        return menu.run_menu(cfg, console, api, run_objective)
+
     if not session["messages"]:
         session["messages"] = prompts.initial_messages(session.get("objective") or "(interactive)", cfg.get("scope", []))
 
     # ---- single-shot mode ------------------------------------------------
     if args.objective:
-        messages, msg = run_agent(session["messages"], ctx, api, console)
-        session["messages"] = messages
-        save(cfg, session, messages)
-        if args.report:
-            from hackgpt.report import render_markdown
-            path = os.path.join(C.OUTPUT_DIR, f"report-{session['name']}.md")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write(render_markdown(session, cfg))
-            console.status(f"report saved -> {path}")
+        _, msg = run_objective(args.objective, cfg, session, console, api, ctx,
+                               save_report=args.report)
         return 0 if msg else 1
 
     # ---- interactive console --------------------------------------------
     console.status("interactive console — type /help for commands, /exit to quit")
+    console.status("tip: `hackgpt --menu` for a guided menu, `hackgpt --auto <target>` for a one-command engagement")
     while True:
         try:
             line = console.ask("hackgpt")
