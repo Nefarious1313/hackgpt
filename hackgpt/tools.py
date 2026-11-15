@@ -617,6 +617,8 @@ def h_encode(args: dict, ctx: Ctx) -> str:
         raise ToolError("encode: op must be encode|decode")
     if codec not in CODECS:
         raise ToolError(f"encode: unknown codec '{codec}' (choose {', '.join(CODECS)})")
+    ctx.console.log_action("encode", f"{codec}/{op}")
+    ctx.session["actions"].append({"tool": "encode", "codec": codec, "op": op, "ts": _ts()})
 
     if codec == "jwt":
         if op == "encode":

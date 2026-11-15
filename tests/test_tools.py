@@ -51,6 +51,7 @@ class Encode(unittest.TestCase):
         ctx = make_ctx()
         enc = h_encode({"input": "hello world", "op": "encode", "codec": "base64"}, ctx)
         self.assertEqual(enc, "aGVsbG8gd29ybGQ=")
+        self.assertEqual(ctx.session["actions"][-1]["tool"], "encode")
         self.assertEqual(h_encode({"input": enc, "op": "decode", "codec": "base64"}, ctx), "hello world")
 
     def test_hex_roundtrip(self):
