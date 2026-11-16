@@ -42,6 +42,20 @@ DEFAULT_CONFIG: dict[str, t.Any] = {
     "curl": "curl",
     "timeout_default": 90,
     "user_agent": "HackGPT/1.0 (red-team-copilot)",
+    # Metasploit: search/planning/payload generation are always available;
+    # module execution (msf_exec) is opt-in and scope-bound.
+    "msfconsole": "msfconsole",
+    "msfvenom": "msfvenom",
+    "msf_execute": False,
+    "msf_confirm": True,
+    # Remote Metasploit RPC (msfrpcd). Point host at a box running msfrpcd,
+    # preferably reachable through an SSH tunnel (127.0.0.1).
+    "msfrpcd_host": "",
+    "msfrpcd_port": 55553,
+    "msfrpcd_user": "msf",
+    "msfrpcd_pass": "",
+    "msfrpcd_ssl": False,
+    "msfrpcd_timeout": 60,
     # Authorized engagement scope (populated with the `scope` tool)
     "scope": [],
     "exclude": [],

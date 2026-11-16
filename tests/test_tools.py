@@ -16,6 +16,12 @@ from hackgpt.tools import (
     h_encode,
     h_file_write,
     h_hash_info,
+    h_mitm_audit,
+    h_mitm_demo,
+    h_msf_catalog,
+    h_msf_exec,
+    h_msf_payload,
+    h_msf_plan,
     h_nmap,
     h_note,
     h_payload_gen,
@@ -24,7 +30,6 @@ from hackgpt.tools import (
     h_shell,
     h_tls_cert,
     h_web_dirs,
-    h_msf_catalog,
     h_dns_snapshot,
 )
 
@@ -288,6 +293,236 @@ class MetasploitCatalog(unittest.TestCase):
     def test_search_query_rejects_command_separators(self):
         with self.assertRaises(ToolError):
             h_msf_catalog({"action": "search", "query": "http; exploit"}, make_ctx())
+
+    def test_search_type_selectable(self):
+        ctx = make_ctx()
+        proc = type("Proc", (), {"stdout": "exploit/multi/handler\n", "stderr": "", "returncode": 0})()
+        with patch("hackgpt.tools.C.which", return_value="/usr/bin/msfconsole"):
+            with patch("hackgpt.tools.subprocess.run", return_value=proc) as run:
+                out = h_msf_catalog({"action": "search", "query": "handler", "type": "exploit"}, ctx)
+        self.assertIn("type:exploit", run.call_args.args[0][-1])
+        self.assertIn("exploit/multi/handler", out)
+
+    def test_bad_type_rejected(self):
+        with patch("hackgpt.tools.C.which", return_value="/usr/bin/msfconsole"):
+            with self.assertRaises(ToolError):
+                h_msf_catalog({"action": "search", "query": "x", "type": "nope"}, make_ctx())
+
+
+class _Proc:
+    def __init__(self, stdout: str = "", stderr: str = "", returncode: int = 0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.returncode = returncode
+
+
+class _FakeResp:
+    status_code = 200
+    headers: dict = {}
+    content = b"<html></html>"
+    text = ""
+
+
+class _FakeHTTPClient:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def get(self, *args, **kwargs):
+        return _FakeResp()
+
+
+class MitmAudit(unittest.TestCase):
+    def test_requires_target(self):
+        with self.assertRaises(ToolError):
+            h_mitm_audit({}, make_ctx(scope=["example.com"]))
+
+    def test_out_of_scope(self):
+        with self.assertRaises(ScopeDenied):
+            h_mitm_audit({"target": "example.com"}, make_ctx(scope=[]))
+
+    def test_dry_run(self):
+        ctx = make_ctx(scope=["example.com"], dry_run=True)
+        out = h_mitm_audit({"target": "example.com"}, ctx)
+        self.assertIn("[dry-run] would run a read-only MITM-resilience audit", out)
+
+    def test_missing_openssl(self):
+        with patch("hackgpt.tools.C.which", return_value=None):
+            with self.assertRaises(ToolError):
+                h_mitm_audit({"target": "example.com"}, make_ctx(scope=["example.com"]))
+
+    def test_parses_posture_and_records_findings(self):
+        ctx = make_ctx(scope=["example.com"])
+        sclient = ("Protocol  : TLSv1.2\n"
+                   "Cipher    : ECDHE-RSA-AES256-GCM-SHA384\n"
+                   "Verify return code: 0 (ok)\n"
+                   "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
+        x509 = ("Subject: CN = example.com\n"
+                "Issuer: CN = Example CA\n"
+                "Not After : Nov 15 12:00:00 2027 GMT\n"
+                "Signature Algorithm: sha256WithRSAEncryption\n"
+                "X509v3 Subject Alternative Name:\n"
+                "    DNS:example.com\n")
+
+        def fake_run(cmd, **kwargs):
+            return _Proc(stdout=x509 if "x509" in cmd else sclient)
+
+        with patch("hackgpt.tools.C.which", return_value="/usr/bin/openssl"):
+            with patch("hackgpt.tools.subprocess.run", side_effect=fake_run):
+                with patch("hackgpt.tools._http_client", return_value=_FakeHTTPClient()):
+                    out = h_mitm_audit({"target": "example.com"}, ctx)
+        self.assertIn("MITM resilience audit — example.com:443", out)
+        # every protocol probe succeeds against the mock -> legacy versions reported
+        self.assertIn("legacy TLS versions accepted", out)
+        self.assertEqual(ctx.session["actions"][-1]["tool"], "mitm_audit")
+        texts = "\n".join(f.get("text", "") for f in ctx.session["findings"])
+        self.assertIn("HSTS header missing", texts)
+        self.assertTrue(any(f.get("severity") == "high" for f in ctx.session["findings"]))
+
+    def test_unreachable_endpoint_rates_unknown(self):
+        ctx = make_ctx(scope=["example.com"])
+        with patch("hackgpt.tools.C.which", return_value="/usr/bin/openssl"):
+            with patch("hackgpt.tools.subprocess.run", return_value=_Proc(stdout="", stderr="connect: Connection refused", returncode=1)):
+                out = h_mitm_audit({"target": "example.com"}, ctx)
+        self.assertIn("UNKNOWN", out)
+        self.assertIn("handshake failed", out)
+
+
+class MitmDemo(unittest.TestCase):
+    def test_synthetic_only(self):
+        ctx = make_ctx()
+        out = h_mitm_demo({}, ctx)
+        self.assertIn("SYNTHETIC", out)
+        self.assertIn("DETECTION AND DEFENSE", out)
+        self.assertEqual(ctx.session["actions"][-1]["tool"], "mitm_demo")
+
+
+class MsfPayload(unittest.TestCase):
+    def test_missing_binary(self):
+        with patch("hackgpt.tools.C.which", return_value=None):
+            with self.assertRaises(ToolError):
+                h_msf_payload({"payload": "linux/x64/meterpreter/reverse_tcp",
+                               "lhost": "1.2.3.4", "lport": "4444"}, make_ctx())
+
+    def test_builds_command_and_saves_artifact(self):
+        ctx = make_ctx()
+        out_path = os.path.join(ctx.output_dir, "msf-payload-4444.elf")
+        with open(out_path, "w", encoding="utf-8"):
+            pass  # simulate msfvenom output file
+        with patch("hackgpt.tools.C.which", return_value="/usr/bin/msfvenom"):
+            with patch("hackgpt.tools.subprocess.run",
+                       return_value=_Proc(stdout="Payload size: 120")) as run:
+                out = h_msf_payload({"payload": "linux/x64/meterpreter/reverse_tcp",
+                                     "lhost": "1.2.3.4", "lport": "4444", "format": "elf"}, ctx)
+        cmd = run.call_args.args[0]
+        self.assertIn("-p", cmd)
+        self.assertIn("linux/x64/meterpreter/reverse_tcp", cmd)
+        self.assertIn("LHOST=1.2.3.4", cmd)
+        self.assertIn("LPORT=4444", cmd)
+        self.assertIn("-f", cmd)
+        self.assertIn(out_path, out)
+        self.assertIn(out_path, ctx.session["artifacts"])
+
+    def test_rejects_injection(self):
+        with self.assertRaises(ToolError):
+            h_msf_payload({"payload": "linux/x64/meterpreter/reverse_tcp; id",
+                           "lhost": "1.2.3.4", "lport": "4444"}, make_ctx())
+
+    def test_dry_run_previews_command(self):
+        ctx = make_ctx(dry_run=True)
+        out = h_msf_payload({"payload": "linux/x64/meterpreter/reverse_tcp",
+                             "lhost": "1.2.3.4", "lport": "4444"}, ctx)
+        self.assertIn("[dry-run] would generate:", out)
+
+
+class MsfPlan(unittest.TestCase):
+    def test_writes_runbook(self):
+        ctx = make_ctx(scope=["127.0.0.1"])
+        out = h_msf_plan({"module": "exploit/multi/handler", "rhosts": "127.0.0.1",
+                          "lhost": "10.0.0.2"}, ctx)
+        path = os.path.join(ctx.output_dir, "msf-runbook.rc")
+        self.assertTrue(os.path.exists(path))
+        with open(path, encoding="utf-8") as fh:
+            body = fh.read()
+        self.assertIn("use exploit/multi/handler", body)
+        self.assertIn("set RHOSTS 127.0.0.1", body)
+        self.assertIn("set LHOST 10.0.0.2", body)
+        self.assertIn(path, ctx.session["artifacts"])
+        self.assertIn("runbook written ->", out)
+
+    def test_out_of_scope_rhosts(self):
+        with self.assertRaises(ScopeDenied):
+            h_msf_plan({"module": "exploit/multi/handler", "rhosts": "example.com"},
+                       make_ctx(scope=[]))
+
+    def test_invalid_module(self):
+        with self.assertRaises(ToolError):
+            h_msf_plan({"module": "exploit/a b", "rhosts": "127.0.0.1"},
+                       make_ctx(scope=["127.0.0.1"]))
+
+    def test_lhost_newline_rejected(self):
+        with self.assertRaises(ToolError):
+            h_msf_plan({"module": "exploit/multi/handler", "rhosts": "127.0.0.1",
+                        "lhost": "1.2.3.4\nset X evil"}, make_ctx(scope=["127.0.0.1"]))
+
+    def test_dry_run_does_not_write(self):
+        ctx = make_ctx(scope=["127.0.0.1"], dry_run=True)
+        out = h_msf_plan({"module": "exploit/multi/handler", "rhosts": "127.0.0.1"}, ctx)
+        self.assertIn("[dry-run] would write runbook", out)
+        self.assertFalse(os.path.exists(os.path.join(ctx.output_dir, "msf-runbook.rc")))
+
+
+class MsfExec(unittest.TestCase):
+    def _rc(self, ctx, rhosts="127.0.0.1"):
+        path = os.path.join(ctx.output_dir, "msf-run.rc")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(f"use exploit/multi/handler\nset RHOSTS {rhosts}\nrun\n")
+        return path
+
+    def test_disabled_by_default(self):
+        ctx = make_ctx(scope=["127.0.0.1"])
+        self._rc(ctx)
+        with self.assertRaises(ToolError) as cm:
+            h_msf_exec({"rc": "msf-run.rc"}, ctx)
+        self.assertIn("disabled", str(cm.exception))
+
+    def test_out_of_scope_rhosts(self):
+        ctx = make_ctx(scope=[])
+        ctx.config["msf_execute"] = True
+        self._rc(ctx, rhosts="10.1.1.1")
+        with self.assertRaises(ScopeDenied):
+            h_msf_exec({"rc": "msf-run.rc"}, ctx)
+
+    def test_dry_run(self):
+        ctx = make_ctx(scope=["127.0.0.1"], dry_run=True)
+        ctx.config["msf_execute"] = True
+        self._rc(ctx)
+        out = h_msf_exec({"rc": "msf-run.rc"}, ctx)
+        self.assertIn("[dry-run] would run: msfconsole -q -r", out)
+
+    def test_confirm_cancel(self):
+        ctx = make_ctx(scope=["127.0.0.1"])
+        ctx.config["msf_execute"] = True
+        ctx.console.confirm = lambda prompt: False
+        self._rc(ctx)
+        with patch("hackgpt.tools.C.which", return_value="/usr/bin/msfconsole"):
+            out = h_msf_exec({"rc": "msf-run.rc"}, ctx)
+        self.assertEqual(out, "cancelled by operator")
+
+    def test_runs_script(self):
+        ctx = make_ctx(scope=["127.0.0.1"])
+        ctx.config["msf_execute"] = True
+        self._rc(ctx)
+        with patch("hackgpt.tools.C.which", return_value="/usr/bin/msfconsole"):
+            with patch("hackgpt.tools.subprocess.run",
+                       return_value=_Proc(stdout="session opened")) as run:
+                out = h_msf_exec({"rc": "msf-run.rc", "timeout": 5}, ctx)
+        self.assertIn("rc=0", out)
+        self.assertIn("session opened", out)
+        self.assertEqual(run.call_args.args[0][:2], ["/usr/bin/msfconsole", "-q"])
+        self.assertEqual(ctx.session["actions"][-1]["tool"], "msf_exec")
 
 
 if __name__ == "__main__":

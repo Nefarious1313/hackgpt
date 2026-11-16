@@ -26,7 +26,15 @@ from .tools import (
     h_hash_info,
     h_http_probe,
     h_ip_info,
+    h_mitm_audit,
     h_msf_catalog,
+    h_msf_exec,
+    h_msf_payload,
+    h_msf_plan,
+    h_msf_rpc_console,
+    h_msf_rpc_run,
+    h_msf_rpc_session,
+    h_msf_rpc_status,
     h_nmap,
     h_note,
     h_report,
@@ -121,6 +129,8 @@ def doctor(cfg: dict, fix: bool = False, console: t.Any = None) -> bool:
     rows.append(("model", str(cfg.get("model")), True))
     rows.append(("base_url", str(cfg.get("base_url")), True))
     rows.append(("scope enforcement", str(cfg.get("enforce_scope")), True))
+    rows.append(("msf execution", "enabled" if cfg.get("msf_execute") else "disabled (opt-in)", True))
+    rows.append(("msf rpc host", str(cfg.get("msfrpcd_host") or "not configured"), True))
 
     for name, val, good in rows:
         line = f"{'OK ' if good else '!! '} {name}: {val}"
@@ -190,20 +200,29 @@ def _subdomain_count(ctx: Ctx) -> int:
 
 def auto_engagement(target: str, cfg: dict, session: dict, console: t.Any,
                     deep: bool = False, dry_run: bool = False,
-                    research: bool = False) -> dict:
-    """Full deterministic pipeline: recon -> scan -> web -> report."""
+                    research: bool = False, mitm: bool = False, msf: bool = False,
+                    msf_execute: bool = False) -> dict:
+    """Deterministic pipeline: recon -> scan -> web -> (MITM audit) -> (research/MSF) -> report.
+
+    `mitm`/`msf` add capability phases. `msf_execute` lets this run execute the
+    generated runbooks without persisting the flag; scope and confirmation are
+    still enforced by h_msf_exec itself.
+    """
     target = C.normalize_target(str(target).strip()) or str(target).strip()
     _seed_scope(cfg, target)
-    ctx = make_ctx(cfg, session, console, dry_run)
+    run_cfg = dict(cfg, msf_execute=True) if msf_execute and not cfg.get("msf_execute") else cfg
+    ctx = make_ctx(run_cfg, session, console, dry_run)
     console.banner(
         f"auto engagement: {target}\n"
         f"session: {session['name']}   profile: {'deep (nmap -p- -sV)' if deep else 'standard (nmap --top-ports 100)'}\n"
         f"dry-run: {dry_run}   scope enforcement: {cfg.get('enforce_scope')}"
+        f"{'   mitm audits: on' if mitm else ''}{'   msf planning: on' if msf else ''}"
     )
-    summary = {"target": target, "subdomains": 0, "open_ports": [], "web": [], "findings": 0}
+    summary = {"target": target, "subdomains": 0, "open_ports": [], "web": [],
+               "findings": 0, "mitm": [], "msf": []}
 
     # 1 -- recon
-    _say(console, "[1/4] recon")
+    _say(console, "[1/5] recon")
     if _is_ip(target):
         console.tool(h_ip_info({"target": target}, ctx)[:900])
     else:
@@ -213,7 +232,7 @@ def auto_engagement(target: str, cfg: dict, session: dict, console: t.Any,
         summary["subdomains"] = _subdomain_count(ctx)
 
     # 2 -- port scan
-    _say(console, "[2/4] port scan")
+    _say(console, "[2/5] port scan")
     profile = "full" if deep else "top100"
     console.tool(h_nmap({"target": target, "profile": profile}, ctx)[:1200])
     open_ports = _open_ports(ctx)
@@ -224,7 +243,7 @@ def auto_engagement(target: str, cfg: dict, session: dict, console: t.Any,
                 "category": "target", "host": target}, ctx)
 
     # 3 -- web
-    _say(console, "[3/4] web checks")
+    _say(console, "[3/5] web checks")
     urls = [f"http://{target}", f"https://{target}"]
     for p in open_ports:
         try:
@@ -258,25 +277,110 @@ def auto_engagement(target: str, cfg: dict, session: dict, console: t.Any,
     if live:
         h_note({"text": f"live web endpoints: {', '.join(live)}", "category": "finding", "host": target}, ctx)
 
-    # 4 -- research + report
-    if research and open_ports:
-        _say(console, "[4/4] research")
-        seen_services: set[str] = set()
-        for p in open_ports:
-            name = (p.get("service") or "").strip()
-            if not name or name in seen_services:
-                continue
-            seen_services.add(name)
-            if len(seen_services) > 3:
-                break
-            console.tool(h_cve_lookup({"query": name}, ctx)[:500])
-    else:
-        _say(console, "[4/4] report")
+    # 3b -- MITM resilience audits (read-only posture checks)
+    if mitm:
+        audits = [u.split("://", 1)[1] for u in live if u.startswith("https://")]
+        summary["mitm"] = audits
+        if audits:
+            _say(console, "[3/5] MITM resilience audits")
+            for netloc in audits:
+                console.tool(h_mitm_audit({"target": netloc}, ctx)[:900])
+        else:
+            _say(console, "[3/5] MITM resilience audits (no live HTTPS endpoints)")
 
+    # 4 -- research (+ MSF runbook planning when requested)
+    if research or msf:
+        if open_ports:
+            _say(console, "[4/5] research")
+            seen_services: set[str] = set()
+            for p in open_ports:
+                name = (p.get("service") or "").strip()
+                if not name or name in seen_services:
+                    continue
+                seen_services.add(name)
+                if len(seen_services) > 3:
+                    break
+                console.tool(h_cve_lookup({"query": name}, ctx)[:500])
+            if msf:
+                summary["msf"] = _auto_msf(ctx, target, open_ports, console)
+        else:
+            _say(console, "[4/5] research/MSF (no open ports — nothing to do)")
+    else:
+        _say(console, "[4/5] research/MSF (disabled)")
+
+    # 5 -- report
+    _say(console, "[5/5] report")
     h_report({"action": "save"}, ctx)
     summary["findings"] = len(session.get("findings", []))
     _print_summary(console, summary, session)
     return summary
+
+
+def _auto_msf(ctx: Ctx, target: str, open_ports: list[dict], console: t.Any) -> list[str]:
+    """Search the local catalog per service and write ready-to-review runbooks.
+
+    Execution stays opt-in: when msf_execute is enabled, each generated runbook is
+    also executed (msf_exec re-checks scope and confirmation itself).
+    """
+    artifacts: list[str] = []
+    if ctx.dry_run:
+        console.tool("msf: [dry-run] would search the catalog per service and write runbooks")
+        return artifacts
+    if not C.which(ctx.config.get("msfconsole", "msfconsole")):
+        console.tool("msf: msfconsole not installed locally — skipping runbook generation "
+                     "(install Metasploit Framework or point config 'msfconsole' at it)")
+        return artifacts
+    seen: set[str] = set()
+    for p in open_ports:
+        svc = (p.get("service") or "").strip()
+        if not svc or svc in seen:
+            continue
+        seen.add(svc)
+        if len(seen) > 3:
+            break
+        try:
+            res = h_msf_catalog({"action": "search", "query": svc, "type": "exploit"}, ctx)
+        except Exception as exc:  # noqa: BLE001
+            console.tool(f"msf: catalog search failed for '{svc}': {exc}")
+            continue
+        module = ""
+        # search prints a ranked table: "  1  exploit/linux/http/foo  2024-..  normal ..."
+        m = re.search(r"(?m)^\s*\d+\s+((?:auxiliary|exploit|post|payload|encoder|nops)/[A-Za-z0-9_/.\-]+)", res)
+        if m:
+            module = m.group(1)
+        else:
+            m = re.search(r"\b((?:auxiliary|exploit|post|payload|encoder|nops)/[A-Za-z0-9_/.\-]+)\b", res)
+            if m:
+                module = m.group(1)
+        if not module:
+            console.tool(f"msf: no local exploit module matched '{svc}'")
+            continue
+        name = re.sub(r"[^A-Za-z0-9_.\-]", "_", svc) or "svc"
+        out = h_msf_plan({"module": module, "rhosts": target, "name": f"auto-{name}"}, ctx)
+        console.tool(out[:700])
+        path = os.path.join(C.OUTPUT_DIR, f"msf-auto-{name}.rc")
+        if os.path.exists(path):
+            artifacts.append(path)
+        if ctx.config.get("msf_execute"):
+            try:
+                console.tool(h_msf_exec({"rc": path, "timeout": 300}, ctx)[:900])
+            except Exception as exc:  # noqa: BLE001
+                console.tool(f"msf: execution skipped: {exc}")
+    return artifacts
+
+
+def full_engagement(target: str, cfg: dict, session: dict, console: t.Any,
+                    deep: bool = False, dry_run: bool = False,
+                    msf_execute: bool = False) -> dict:
+    """Maximal one-command pipeline: recon -> scan -> web -> MITM audit -> MSF runbooks -> report."""
+    console.banner(
+        f"full engagement: {target}\n"
+        f"includes: MITM-resilience audits + Metasploit runbook planning\n"
+        f"session: {session['name']}   dry-run: {dry_run}"
+        f"   msf exec: {bool(msf_execute or cfg.get('msf_execute'))}"
+    )
+    return auto_engagement(target, cfg, session, console, deep=deep, dry_run=dry_run,
+                           research=True, mitm=True, msf=True, msf_execute=msf_execute)
 
 
 def quick_scan(target: str, cfg: dict, session: dict, console: t.Any,
@@ -367,16 +471,39 @@ def utility(kind: str, args: dict, cfg: dict, session: dict, console: t.Any) -> 
         return h_web_dirs(args, ctx)
     if kind == "msf":
         return h_msf_catalog(args, ctx)
+    if kind == "mitm":
+        target = str(args.get("target", "")).strip()
+        if target:
+            _seed_scope(cfg, target)
+        return h_mitm_audit(args, ctx)
+    if kind == "msf_payload":
+        return h_msf_payload(args, ctx)
+    if kind == "msf_plan":
+        return h_msf_plan(args, ctx)
+    if kind == "msf_exec":
+        return h_msf_exec(args, ctx)
+    if kind == "rpc_status":
+        return h_msf_rpc_status(args, ctx)
+    if kind == "rpc_console":
+        return h_msf_rpc_console(args, ctx)
+    if kind == "rpc_run":
+        return h_msf_rpc_run(args, ctx)
+    if kind == "rpc_session":
+        return h_msf_rpc_session(args, ctx)
     raise ValueError(f"unknown utility '{kind}'")
 
 
 def _print_summary(console: t.Any, summary: dict, session: dict) -> None:
     ports = ", ".join(str(p["port"]) for p in summary["open_ports"][:20]) or "-"
+    mitm = ", ".join(summary.get("mitm") or []) or "-"
+    msf = ", ".join(os.path.basename(p) for p in summary.get("msf") or []) or "-"
     text = "\n".join([
         f"### Auto engagement summary — {summary['target']}",
         f"- subdomains: {summary['subdomains']}",
         f"- open ports: {ports}",
         f"- live web: {', '.join(summary['web']) or '-'}",
+        f"- mitm audits: {mitm}",
+        f"- msf runbooks: {msf}",
         f"- findings recorded: {summary['findings']}",
         f"- report: {os.path.join(C.OUTPUT_DIR, 'report-' + session['name'] + '.md')}",
     ])

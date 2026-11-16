@@ -66,7 +66,8 @@ def render_markdown(session: dict, config: dict) -> str:  # noqa: ARG001
     if actions:
         lines += ["| time | tool | detail |", "| --- | --- | --- |"]
         for a in actions[-200:]:
-            detail = a.get("cmd") or a.get("target") or a.get("url") or a.get("domain") or ""
+            detail = a.get("cmd") or a.get("target") or a.get("url") or a.get("domain") \
+                or a.get("runbook") or a.get("rc") or ""
             detail = str(detail).replace("|", "\\|")[:160]
             lines.append(f"| {a.get('ts','')} | {a.get('tool','')} | {detail} |")
     else:

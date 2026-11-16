@@ -3,9 +3,12 @@
 A custom, local, terminal-native offensive-security copilot wrapped around the
 free Nous inference model (`meituan/longcat-2.5:free` by default). It plans an
 engagement, drives real tools (nmap, DNS, HTTP, CVE research, payload
-generation, encoding, IP intel, TLS and directory checks), records findings,
-and writes a markdown report. Point it at a target and it runs the whole
-engagement itself (`--auto`), or pick a numbered option from `--menu`.
+generation, encoding, IP intel, TLS, directory checks and read-only MITM
+resilience auditing), records findings, and writes a markdown report. Its
+three-layer Metasploit integration covers catalog search, `msfvenom` payload
+generation and reviewed `.rc` runbooks — with opt-in module execution. Point it
+at a target and it runs the whole engagement itself (`--auto` / `--full`), or
+pick a numbered option from `--menu`.
 
 Nothing leaves the device except the API calls to the Nous endpoint and whatever
 targets you point it at. The OAuth bearer is read from Hermes' auth state
@@ -31,6 +34,9 @@ hackgpt --help
 ```bash
 # Simplest: one target, full pipeline, report (no model needed)
 hackgpt --auto example.com
+
+# Maximal pipeline: recon -> scan -> web -> MITM audit -> MSF runbooks -> report
+hackgpt --full example.com
 
 # Guided numbered menu
 hackgpt --menu
@@ -61,12 +67,13 @@ even while the Nous free tier is at capacity.
 
 ```bash
 hackgpt --auto example.com            # recon -> scan -> web -> report
+hackgpt --full example.com            # + MITM audits + Metasploit runbook planning
 hackgpt --auto 203.0.113.0/24 --deep --research
 hackgpt --quick example.com           # nmap top100 + web probe
 hackgpt --web https://example.com      # headers/methods/CORS/paths + TLS
 hackgpt --watch-dns example.com --interval 3600 --count 0  # monitor DNS until Ctrl-C
 hackgpt --dry-run --watch-dns example.com --count 1       # preview a single poll
-hackgpt --menu                        # guided menu (option 9 watches DNS)
+hackgpt --menu                        # guided menu (option 10 watches DNS)
 hackgpt --doctor                      # check deps / auth / model
 hackgpt --doctor --fix                # install what is missing
 ```
@@ -74,18 +81,27 @@ hackgpt --doctor --fix                # install what is missing
 Every mode writes `sessions/<name>.json` and `output/report-<name>.md`. `--auto`
 seeds the scope for the target automatically; `--deep` uses `nmap -p- -sV`;
 `--research` adds a short CVE pass over discovered services. Add `--dry-run` to
-preview without touching the network or the host.
+preview without touching the network or the host. `--msf-exec` allows a full
+engagement to execute the generated Metasploit runbooks (scope-bound, confirmed
+unless `--msf-no-confirm`).
 
 ## Scope model
 
 Offensive tools (`nmap_scan`, `http_probe`, `web_vuln_scan`, `dns_recon`,
-`subdomain_enum`, `ip_info`, `tls_cert`, `web_dirs`) refuse targets outside the
-authorized scope. `shell` runs on the operator host and is never scope-bound.
-Scope lives in `~/hackgpt/config.yaml` and is managed with the `scope` tool or
-`/scope`.
+`subdomain_enum`, `ip_info`, `tls_cert`, `web_dirs`, `mitm_audit`,
+`dns_snapshot`, and the RHOSTS of `msf_plan`/`msf_exec`) refuse targets outside
+the authorized scope. `shell` runs on the operator host and is never
+scope-bound. Scope lives in `~/hackgpt/config.yaml` and is managed with the
+`scope` tool or `/scope`.
 
 Scope entries accept hosts, domains, IPs, CIDR ranges, and `*.domain` wildcards.
 `--no-scope` disables enforcement for lab/CTF use.
+
+Metasploit is layered. Catalog search, `msfvenom` payload generation and
+runbook planning are always available. Executing modules with `msf_exec`
+requires explicit enablement (`msf_execute: true` in config.yaml, or
+`--msf-exec`), keeps every RHOSTS entry inside scope, and asks for confirmation
+unless `msf_confirm` is disabled (or `--msf-no-confirm` is passed).
 
 ## Toolset
 
@@ -107,7 +123,12 @@ Scope entries accept hosts, domains, IPs, CIDR ranges, and `*.domain` wildcards.
 | `tls_cert` | Fetch and parse the TLS certificate for host:port (openssl) |
 | `web_dirs` | Probe common paths or a supplied wordlist on a web server |
 | `dns_snapshot` | Persist scoped A/AAAA baseline and report DNS changes |
-| `msf_catalog` | Check Metasploit or search auxiliary modules locally; no module execution |
+| `msf_catalog` | Check Metasploit availability / search its module catalog (auxiliary, exploit, post, payload, …); search-only |
+| `msf_payload` | Generate a Metasploit payload with msfvenom into a file (elf, exe, raw, apk, …) |
+| `msf_plan` | Write a reviewed Metasploit `.rc` runbook for a module + in-scope RHOSTS |
+| `msf_exec` | Execute a runbook via msfconsole — opt-in (`--msf-exec`), scope-bound, confirmed |
+| `mitm_audit` | Read-only MITM-resilience audit: cert validity/hostname/chain, TLS versions, cipher strength, HSTS, plaintext fallback |
+| `mitm_demo` | Local synthetic MITM attack-chain walkthrough + defensive checklist (no network) |
 | `note` | Record findings/credentials/targets with evidence |
 | `scope` | list/add/remove/check authorized targets |
 | `file_write` | Write an artifact (exploit, wordlist, script) |
@@ -174,5 +195,9 @@ registry consistency, and the agent loop's tool dispatch + prose-JSON fallback.
   are absent; install `dnsutils` (`hackgpt --doctor --fix`) for MX/NS/TXT/SOA.
 - Active scans are rate-limited by profile; keep `stealth`/`udp` for ranges you
   own (they need raw sockets / root).
+- Metasploit is not packaged for Termux, so `--doctor` reports `msfconsole` /
+  `msfvenom` as absent. Catalog search, payload generation and runbook planning
+  degrade gracefully (they say what is missing); point `msfconsole`/`msfvenom`
+  in config.yaml at a local install or an SSH wrapper to use them live.
 - Only test systems you are authorized to test. Scope enforcement is on by
   default; `--no-scope` is for labs and CTFs.

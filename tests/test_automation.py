@@ -86,9 +86,69 @@ class Utilities(unittest.TestCase):
         out = A.utility("hash", {"hash": "a" * 32}, _cfg(), _session(), FakeConsole())
         self.assertIn("MD5", out)
 
+    def test_mitm_utility_seeds_scope(self):
+        cfg, sess, console = _cfg(), _session("u-mitm"), FakeConsole()
+        orig = A.h_mitm_audit
+        A.h_mitm_audit = lambda args, ctx: "mitm-ok"
+        try:
+            out = A.utility("mitm", {"target": "example.com"}, cfg, sess, console)
+        finally:
+            A.h_mitm_audit = orig
+        self.assertEqual(out, "mitm-ok")
+        self.assertTrue(C.target_in_scope("example.com", cfg["scope"]))
+
+    def test_msf_utilities_dispatch(self):
+        cfg, sess, console = _cfg(), _session("u-msf"), FakeConsole()
+        orig_plan, orig_payload = A.h_msf_plan, A.h_msf_payload
+        A.h_msf_plan = lambda args, ctx: "plan-ok"
+        A.h_msf_payload = lambda args, ctx: "payload-ok"
+        try:
+            self.assertEqual(A.utility("msf_plan", {}, cfg, sess, console), "plan-ok")
+            self.assertEqual(A.utility("msf_payload", {}, cfg, sess, console), "payload-ok")
+        finally:
+            A.h_msf_plan, A.h_msf_payload = orig_plan, orig_payload
+
+    def test_rpc_utilities_dispatch(self):
+        cfg, sess, console = _cfg(), _session("u-rpc"), FakeConsole()
+        orig = (A.h_msf_rpc_status, A.h_msf_rpc_run, A.h_msf_rpc_session)
+        A.h_msf_rpc_status = lambda args, ctx: "rpc-status-ok"
+        A.h_msf_rpc_run = lambda args, ctx: "rpc-run-ok"
+        A.h_msf_rpc_session = lambda args, ctx: "rpc-session-ok"
+        try:
+            self.assertEqual(A.utility("rpc_status", {}, cfg, sess, console), "rpc-status-ok")
+            self.assertEqual(A.utility("rpc_run", {}, cfg, sess, console), "rpc-run-ok")
+            self.assertEqual(A.utility("rpc_session", {}, cfg, sess, console), "rpc-session-ok")
+        finally:
+            A.h_msf_rpc_status, A.h_msf_rpc_run, A.h_msf_rpc_session = orig
+
     def test_unknown_utility(self):
         with self.assertRaises(ValueError):
             A.utility("nope", {}, _cfg(), _session(), FakeConsole())
+
+
+class FullEngagement(unittest.TestCase):
+    def test_dry_run_localhost_offline(self):
+        cfg, sess, console = _cfg(), _session("full-dry"), FakeConsole()
+        summary = A.full_engagement("127.0.0.1", cfg, sess, console, dry_run=True)
+        self.assertEqual(summary["target"], "127.0.0.1")
+        self.assertEqual(summary["mitm"], [])
+        self.assertEqual(summary["msf"], [])
+        self.assertTrue(C.target_in_scope("127.0.0.1", cfg["scope"]))
+        report = os.path.join(C.OUTPUT_DIR, "report-full-dry.md")
+        self.assertTrue(os.path.exists(report))
+
+    def test_mitm_phase_audits_live_https_endpoints(self):
+        cfg, sess, console = _cfg(), _session("auto-mitm"), FakeConsole()
+        orig_probe, orig_audit = A.h_http_probe, A.h_mitm_audit
+        calls: list[str] = []
+        A.h_http_probe = lambda args, ctx: "GET https://127.0.0.1 -> 200 OK"
+        A.h_mitm_audit = lambda args, ctx: calls.append(str(args.get("target"))) or "audit-ok"
+        try:
+            summary = A.auto_engagement("127.0.0.1", cfg, sess, console, dry_run=True, mitm=True)
+        finally:
+            A.h_http_probe, A.h_mitm_audit = orig_probe, orig_audit
+        self.assertIn("127.0.0.1", calls)
+        self.assertEqual(summary["mitm"], ["127.0.0.1"])
 
 
 if __name__ == "__main__":

@@ -32,7 +32,7 @@ from hackgpt.config import ScopeDenied  # noqa: E402
 from hackgpt.tools import HANDLERS, TOOLS, Ctx, ToolError  # noqa: E402
 from hackgpt.ui import Console  # noqa: E402
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 
 
 def build_ctx(cfg: dict, session: dict, console: Console, dry_run: bool) -> Ctx:
@@ -271,6 +271,12 @@ def main() -> int:
     ap.add_argument("--reset", action="store_true", help="start with a clean session history")
     ap.add_argument("--report", action="store_true", help="save report to output/ on exit")
     ap.add_argument("--auto", metavar="TARGET", help="one-command deterministic engagement + report")
+    ap.add_argument("--full", metavar="TARGET",
+                    help="maximal pipeline: recon -> scan -> web -> MITM audit -> MSF runbooks -> report")
+    ap.add_argument("--msf-exec", action="store_true",
+                    help="enable Metasploit module execution for this run (scope-bound, confirmed unless --msf-no-confirm)")
+    ap.add_argument("--msf-no-confirm", action="store_true",
+                    help="with --msf-exec: skip the per-run execution confirmation")
     ap.add_argument("--quick", metavar="TARGET", help="nmap top100 + web probe")
     ap.add_argument("--web", metavar="URL", help="deep web checks on a URL")
     ap.add_argument("--watch-dns", metavar="DOMAIN", help="watch scoped A/AAAA DNS changes (Ctrl-C to stop)")
@@ -294,6 +300,10 @@ def main() -> int:
         cfg["enforce_scope"] = False
     if args.confirm:
         cfg["confirm_shell"] = True
+    if args.msf_exec:
+        cfg["msf_execute"] = True
+    if args.msf_no_confirm:
+        cfg["msf_confirm"] = False
     for t in args.scope:
         if not any((e if isinstance(e, str) else e.get("target")) == t for e in cfg.get("scope", [])):
             cfg.setdefault("scope", []).append({"target": t, "added": time.strftime("%Y-%m-%dT%H:%M:%S")})
@@ -312,6 +322,7 @@ def main() -> int:
         f"scope: {', '.join((e if isinstance(e, str) else e.get('target')) for e in cfg.get('scope', [])) or '(empty)'}\n"
         f"objective: {session.get('objective') or '-'}\n"
         f"dry-run: {args.dry_run}   scope enforcement: {cfg.get('enforce_scope')}"
+        f"   msf execution: {'on' if cfg.get('msf_execute') else 'off'}"
     )
 
     api = NousAPI(cfg)
@@ -336,6 +347,13 @@ def main() -> int:
         prompts.bootstrap_session(sess)
         automation.auto_engagement(args.auto, cfg, sess, console, deep=args.deep,
                                    dry_run=args.dry_run, research=args.research)
+        save(cfg, sess, sess.get("messages", []))
+        return 0
+    if args.full:
+        sess = C.load_session(args.session)
+        prompts.bootstrap_session(sess)
+        automation.full_engagement(args.full, cfg, sess, console, deep=args.deep,
+                                   dry_run=args.dry_run)
         save(cfg, sess, sess.get("messages", []))
         return 0
     if args.quick:
@@ -364,7 +382,8 @@ def main() -> int:
 
     # ---- interactive console --------------------------------------------
     console.status("interactive console — type /help for commands, /exit to quit")
-    console.status("tip: `hackgpt --menu` for a guided menu, `hackgpt --auto <target>` for a one-command engagement")
+    console.status("tip: `hackgpt --menu` for a guided menu, `hackgpt --auto <target>` for a one-command "
+                   "engagement, `hackgpt --full <target>` to add MITM audits + Metasploit runbooks")
     while True:
         try:
             line = console.ask("hackgpt")
