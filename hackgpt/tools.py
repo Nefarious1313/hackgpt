@@ -19,6 +19,7 @@ import socket
 import subprocess
 import time
 import typing as t
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -370,10 +371,109 @@ def h_subdomain_enum(args: dict, ctx: Ctx) -> str:
 # CVE / exploit research
 # --------------------------------------------------------------------------
 
+_NVD_API = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+_CVEAWG_API = "https://cveawg.mitre.org/api/cve"
+_NVD_MIN_GAP = 1.0  # NVD's unauthenticated limit is 5 requests / 30s; backoff handles bursts
+_last_nvd_call = 0.0
+
+
 def _http_get_json(url: str, timeout: int = 30):
     req = urllib.request.Request(url, headers={"User-Agent": "HackGPT/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _nvd_get(params: dict, timeout: int = 30) -> dict:
+    """GET NVD 2.0 with light client-side spacing and backoff on rate limits."""
+    global _last_nvd_call
+    url = _NVD_API + "?" + urllib.parse.urlencode(params)
+    for attempt in range(3):
+        gap = time.monotonic() - _last_nvd_call
+        if gap < _NVD_MIN_GAP:
+            time.sleep(_NVD_MIN_GAP - gap)
+        try:
+            data = _http_get_json(url, timeout=timeout)
+            _last_nvd_call = time.monotonic()
+            return data
+        except urllib.error.HTTPError as exc:
+            _last_nvd_call = time.monotonic()
+            if exc.code in (403, 429) and attempt < 2:
+                time.sleep(7)
+                continue
+            raise
+    return {}
+
+
+def _nvd_row(cve: dict) -> dict:
+    """Normalize an NVD 2.0 CVE object into the flat fields the tools report."""
+    desc = ""
+    for d in cve.get("descriptions") or []:
+        if str(d.get("lang", "")).lower() == "en":
+            desc = str(d.get("value", ""))
+            break
+    if not desc:
+        for d in cve.get("descriptions") or []:
+            desc = str(d.get("value", ""))
+            break
+    score = sev = ""
+    metrics = cve.get("metrics") or {}
+    for key in ("cvssMetricV40", "cvssMetricV31", "cvssMetricV30", "cvssMetricV2"):
+        entries = metrics.get(key) or []
+        if entries:
+            cvss = entries[0].get("cvssData") or {}
+            score = cvss.get("baseScore", "")
+            sev = cvss.get("baseSeverity") or entries[0].get("baseSeverity", "")
+            break
+    refs = [str(r.get("url", "")) for r in (cve.get("references") or []) if r.get("url")]
+    return {
+        "id": cve.get("id", ""),
+        "summary": desc,
+        "cvss": score,
+        "severity": sev,
+        "published": cve.get("published", ""),
+        "refs": refs,
+    }
+
+
+def _cveawg_row(data: dict) -> dict:
+    """Parse the official CVE Program (CVE 5.1) record shape."""
+    meta = data.get("cveMetadata") or {}
+    cna = ((data.get("containers") or {}).get("cna") or {})
+    desc = ""
+    for d in cna.get("descriptions") or []:
+        if str(d.get("lang", "")).lower() == "en":
+            desc = str(d.get("value", ""))
+            break
+    score = sev = ""
+    for m in cna.get("metrics") or []:
+        for key in ("cvssV4_0", "cvssV3_1", "cvssV3_0", "cvssV2_0"):
+            entry = m.get(key)
+            if entry:
+                score = entry.get("baseScore", "")
+                sev = entry.get("baseSeverity", "")
+                break
+        if score != "":
+            break
+    refs = [str(r.get("url", "")) for r in (cna.get("references") or [])
+            if isinstance(r, dict) and r.get("url")]
+    return {
+        "id": meta.get("cveId", ""),
+        "summary": desc or str(cna.get("title", "")),
+        "cvss": score,
+        "severity": sev,
+        "published": meta.get("datePublished", ""),
+        "refs": refs,
+    }
+
+
+def _format_cve(row: dict) -> str:
+    lines = [
+        f"{row['id']}: {row['summary'][:600]}",
+        f"CVSS: {row['cvss'] or 'n/a'}  Severity: {row['severity'] or 'n/a'}  Published: {row['published']}",
+    ]
+    if row["refs"]:
+        lines.append("refs: " + ", ".join(row["refs"][:8]))
+    return "\n".join(lines)
 
 
 def h_cve_lookup(args: dict, ctx: Ctx) -> str:
@@ -383,24 +483,25 @@ def h_cve_lookup(args: dict, ctx: Ctx) -> str:
     ctx.console.log_action("cve_lookup", q)
     try:
         if re.match(r"(?i)^cve-\d{4}-\d+$", q):
-            data = _http_get_json(f"https://cve.circl.lu/api/cve/{q}")
-            lines = [
-                f"{data.get('id')}: {data.get('summary', '')[:600]}",
-                f"CVSS: {data.get('cvss')}  Published: {data.get('Published')}",
-            ]
-            refs = data.get("references", []) or []
-            if refs:
-                lines.append("refs: " + ", ".join(refs[:8]))
-            return "\n".join(lines)
-        data = _http_get_json(f"https://cve.circl.lu/api/search/{urllib.parse.quote(q)}")
-        if isinstance(data, list):
-            if not data:
-                return f"no CVEs matched '{q}'"
-            out = []
-            for row in data[:15]:
-                out.append(f"{row.get('id')}  cvss={row.get('cvss')}  {str(row.get('summary',''))[:140]}")
-            return f"{len(data)} matches for '{q}':\n" + "\n".join(out)
-        return json.dumps(data)[:800]
+            data = _nvd_get({"cveId": q.upper()})
+            vulns = data.get("vulnerabilities") or []
+            if vulns:
+                return _format_cve(_nvd_row(vulns[0].get("cve") or {}))
+            # NVD may lag brand-new IDs; fall back to the official CVE Program API.
+            try:
+                rec = _http_get_json(f"{_CVEAWG_API}/{q.upper()}")
+                if rec.get("cveMetadata"):
+                    return _format_cve(_cveawg_row(rec))
+            except Exception:  # noqa: BLE001
+                pass
+            return f"no CVE record found for '{q}'"
+        data = _nvd_get({"keywordSearch": q, "resultsPerPage": 15})
+        vulns = data.get("vulnerabilities") or []
+        if not vulns:
+            return f"no CVEs matched '{q}'"
+        rows = [_nvd_row(v.get("cve") or {}) for v in vulns[:15]]
+        out = [f"{r['id']}  cvss={r['cvss'] or 'n/a'}  {r['summary'][:140]}" for r in rows]
+        return f"{data.get('totalResults', len(vulns))} total matches for '{q}':\n" + "\n".join(out)
     except Exception as exc:  # noqa: BLE001
         return f"cve_lookup failed: {exc}"
 
@@ -415,19 +516,19 @@ def h_exploit_search(args: dict, ctx: Ctx) -> str:
         res = _run(["searchsploit", "--color", "-w", q], timeout=40)
         if res.strip():
             out.append("[searchsploit]\n" + res.strip()[:3000])
-    if not out:
-        try:
-            data = _http_get_json(f"https://cve.circl.lu/api/search/{urllib.parse.quote(q)}")
-            if isinstance(data, list) and data:
-                out.append(f"CVEs related to '{q}' (fetch exploits from Exploit-DB / GitHub):\n" +
-                           "\n".join(f"{r.get('id')}  {str(r.get('summary',''))[:120]}" for r in data[:10]))
-        except Exception:  # noqa: BLE001
-            pass
+    try:
+        data = _nvd_get({"keywordSearch": q, "resultsPerPage": 5})
+        vulns = data.get("vulnerabilities") or []
+        if vulns:
+            rows = [_nvd_row(v.get("cve") or {}) for v in vulns[:5]]
+            out.append(f"CVEs related to '{q}' (fetch exploits from Exploit-DB / GitHub):\n" +
+                       "\n".join(f"{r['id']}  {r['summary'][:120]}" for r in rows))
+    except Exception:  # noqa: BLE001
+        pass
     if not out:
         out.append("no local exploit DB and no CVE matches; install exploitdb (`pkg install exploitdb` if "
                    "available) or search Exploit-DB online. Provide a CVE id for references.")
     return clip("\n\n".join(out))
-
 
 # --------------------------------------------------------------------------
 # payloads
@@ -897,6 +998,46 @@ def h_dns_snapshot(args: dict, ctx: Ctx) -> str:
 # --------------------------------------------------------------------------
 
 MSF_MODULE_TYPES = ("auxiliary", "exploit", "post", "payload", "encoder", "nops", "all")
+
+# Small offline catalog of read-only/informational modules. Used when no local
+# msfconsole is configured so planning still works; never implies verification.
+_OFFLINE_MSF_CATALOG: dict[str, list[tuple[str, str]]] = {
+    "http": [
+        ("auxiliary/scanner/http/options", "HTTP OPTIONS / allowed methods"),
+        ("auxiliary/scanner/http/robots_txt", "robots.txt disclosure check"),
+        ("auxiliary/scanner/http/title", "HTTP page title enumeration"),
+    ],
+    "http-proxy": [
+        ("auxiliary/scanner/http/options", "HTTP OPTIONS / allowed methods"),
+        ("auxiliary/scanner/http/proxy", "open-proxy detection"),
+    ],
+    "https": [
+        ("auxiliary/scanner/http/options", "HTTP OPTIONS / allowed methods"),
+        ("auxiliary/scanner/http/robots_txt", "robots.txt disclosure check"),
+    ],
+    "ssh": [("auxiliary/scanner/ssh/ssh_version", "SSH banner/version enumeration")],
+    "ftp": [("auxiliary/scanner/ftp/ftp_version", "FTP banner/version enumeration")],
+    "smtp": [("auxiliary/scanner/smtp/smtp_version", "SMTP banner/version enumeration")],
+    "smb": [("auxiliary/scanner/smb/smb_version", "SMB version enumeration")],
+    "mysql": [("auxiliary/scanner/mysql/mysql_version", "MySQL version enumeration")],
+    "postgres": [("auxiliary/scanner/postgres/postgres_version", "PostgreSQL version enumeration")],
+    "rdp": [("auxiliary/scanner/rdp/rdp_scanner", "RDP service enumeration")],
+    "telnet": [("auxiliary/scanner/telnet/telnet_version", "Telnet banner enumeration")],
+    "snmp": [("auxiliary/scanner/snmp/snmp_enum", "SNMP information enumeration")],
+}
+
+
+def _offline_msf_search(query: str, mtype: str) -> str:
+    """Return a best-effort module list without a local Metasploit install."""
+    q = query.lower()
+    rows = [row for key, vals in _OFFLINE_MSF_CATALOG.items() if key in q for row in vals]
+    if not rows:
+        rows = [row for key, vals in _OFFLINE_MSF_CATALOG.items()
+                if any(tok and tok in key for tok in q.split()) for row in vals]
+    if not rows:
+        return "[offline catalog — msfconsole not installed] no module matched"
+    header = f"[offline catalog — msfconsole not installed; type filter '{mtype}' not enforced]"
+    return header + "\n" + "\n".join(f"  {name}  {desc}" for name, desc in rows[:10])
 MSF_MODULE_RE = r"[A-Za-z0-9_/.\-]+"
 MSF_PAYLOAD_RE = r"[A-Za-z0-9_/.\-]+"
 
@@ -942,7 +1083,12 @@ def h_msf_catalog(args: dict, ctx: Ctx) -> str:
     mtype = str(args.get("type") or "auxiliary").lower()
     if mtype not in MSF_MODULE_TYPES:
         raise ToolError(f"msf_catalog: unknown type '{mtype}' (choose {', '.join(MSF_MODULE_TYPES)})")
-    _msf_binary(ctx, "msfconsole", "msfconsole")
+    if not C.which(ctx.config.get("msfconsole", "msfconsole")):
+        result = _offline_msf_search(query, mtype)
+        ctx.session["actions"].append({"tool": "msf_catalog", "action": "search",
+                                       "query": query, "type": mtype,
+                                       "offline": True, "ts": _ts()})
+        return result
     if ctx.dry_run:
         return "[dry-run] would search the local Metasploit catalog; no module would run"
     output = _msf_search(ctx, query, mtype)

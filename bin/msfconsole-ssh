@@ -1,0 +1,28 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# HackGPT -> remote msfconsole over SSH.
+# Point config.yaml at this file:  msfconsole: /data/data/com.termux/files/home/hackgpt/bin/msfconsole-ssh
+# Required env:  MSF_SSH_HOST=user@host   (or separate MSF_SSH_USER / MSF_SSH_HOST)
+# Optional env:  MSF_SSH_PORT=22  MSF_SSH_BIN=msfconsole  MSF_SSH_OPTS='-i ~/.ssh/id_ed25519 -o BatchMode=yes'
+set -euo pipefail
+
+host="${MSF_SSH_HOST:-}"
+user="${MSF_SSH_USER:-}"
+port="${MSF_SSH_PORT:-22}"
+rbin="${MSF_SSH_BIN:-msfconsole}"
+opts="${MSF_SSH_OPTS:-}"
+
+if [ -z "$host" ]; then
+  echo "msfconsole-ssh: MSF_SSH_HOST is not set (e.g. user@metasploit-box)" >&2
+  exit 127
+fi
+dest="$host"
+[ -n "$user" ] && dest="${user}@${host}"
+case "$dest" in *@*) ;; *) dest="root@${dest}" ;; esac
+
+remote="$rbin"
+for arg in "$@"; do
+  remote+=" $(printf '%q' "$arg")"
+done
+
+# shellcheck disable=SC2086
+exec ssh $opts -p "$port" "$dest" "$remote"

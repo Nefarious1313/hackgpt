@@ -1,0 +1,46 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# HackGPT -> remote msfvenom over SSH. Streams generated payload bytes to the
+# local -o path so the artifact lands in the operator's output/ directory.
+# Point config.yaml at this file:  msfvenom: /data/data/com.termux/files/home/hackgpt/bin/msfvenom-ssh
+# Uses the same env vars as msfconsole-ssh; MSF_SSH_BIN defaults to msfvenom.
+set -euo pipefail
+
+host="${MSF_SSH_HOST:-}"
+user="${MSF_SSH_USER:-}"
+port="${MSF_SSH_PORT:-22}"
+rbin="${MSF_SSH_BIN:-msfvenom}"
+opts="${MSF_SSH_OPTS:-}"
+
+if [ -z "$host" ]; then
+  echo "msfvenom-ssh: MSF_SSH_HOST is not set (e.g. user@metasploit-box)" >&2
+  exit 127
+fi
+dest="$host"
+[ -n "${MSF_SSH_USER:-}" ] && dest="${MSF_SSH_USER}@${host}"
+case "$dest" in *@*) ;; *) dest="root@${dest}" ;; esac
+
+out=""
+remote_args=()
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ] && [ -n "${2:-}" ]; then
+    out="$2"
+    shift 2
+    continue
+  fi
+  remote_args+=("$1")
+  shift
+done
+
+remote="$rbin"
+for arg in "${remote_args[@]:-}"; do
+  [ -z "$arg" ] && continue
+  remote+=" $(printf '%q' "$arg")"
+done
+
+# shellcheck disable=SC2086
+if [ -n "$out" ]; then
+  ssh $opts -p "$port" "$dest" "$remote" > "$out"
+  echo "remote payload streamed to $out" >&2
+else
+  exec ssh $opts -p "$port" "$dest" "$remote"
+fi

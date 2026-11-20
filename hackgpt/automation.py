@@ -326,10 +326,11 @@ def _auto_msf(ctx: Ctx, target: str, open_ports: list[dict], console: t.Any) -> 
     if ctx.dry_run:
         console.tool("msf: [dry-run] would search the catalog per service and write runbooks")
         return artifacts
-    if not C.which(ctx.config.get("msfconsole", "msfconsole")):
-        console.tool("msf: msfconsole not installed locally — skipping runbook generation "
-                     "(install Metasploit Framework or point config 'msfconsole' at it)")
-        return artifacts
+    has_msf = bool(C.which(ctx.config.get("msfconsole", "msfconsole")))
+    if not has_msf:
+        console.tool("msf: msfconsole not installed locally — using the offline module catalog; "
+                     "runbooks will be written without module verification "
+                     "(install MSF or point config 'msfconsole' at it to verify)")
     seen: set[str] = set()
     for p in open_ports:
         svc = (p.get("service") or "").strip()
@@ -339,7 +340,8 @@ def _auto_msf(ctx: Ctx, target: str, open_ports: list[dict], console: t.Any) -> 
         if len(seen) > 3:
             break
         try:
-            res = h_msf_catalog({"action": "search", "query": svc, "type": "exploit"}, ctx)
+            res = h_msf_catalog({"action": "search", "query": svc,
+                                 "type": "exploit" if has_msf else "auxiliary"}, ctx)
         except Exception as exc:  # noqa: BLE001
             console.tool(f"msf: catalog search failed for '{svc}': {exc}")
             continue
