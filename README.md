@@ -201,3 +201,4 @@ registry consistency, and the agent loop's tool dispatch + prose-JSON fallback.
   in config.yaml at a local install or an SSH wrapper to use them live.
 - Only test systems you are authorized to test. Scope enforcement is on by
   default; `--no-scope` is for labs and CTFs.
+# hackgpt
